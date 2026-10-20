@@ -3,10 +3,13 @@
 import asyncio
 import json
 import logging
+import shutil
+import subprocess
 import threading
 from functools import partial
 from typing import Callable, Dict, Optional
 
+import requests
 import urllib3
 
 logger = logging.getLogger(__name__)
@@ -465,33 +468,116 @@ class SynologyMCPServer:
         with self._session_locks_guard:
             return self._session_locks.setdefault(normalized, threading.RLock())
 
+    #: Seconds to wait for an endpoint to answer at all before trying the next
+    #: one. Short on purpose: a dead address must cost seconds, not the whole
+    #: client-side startup budget.
+    ENDPOINT_PROBE_TIMEOUT = 3
+
+    def _endpoint_reachable(self, url: str) -> bool:
+        """True if something answers HTTP at `url`. Any status counts."""
+        try:
+            requests.get(
+                f"{url}/webapi/query.cgi",
+                params={
+                    "api": "SYNO.API.Info",
+                    "version": "1",
+                    "method": "query",
+                    "query": "SYNO.API.Auth",
+                },
+                verify=config.verify_ssl_for(url),
+                timeout=self.ENDPOINT_PROBE_TIMEOUT,
+                allow_redirects=False,
+            )
+            return True
+        except requests.RequestException:
+            return False
+
+    def _resolve_password(self, nas_cfg: dict, label: str) -> str:
+        """Return the NAS password: inline `password`, else `password_ref` via 1Password.
+
+        The secret is read with `op read` per process and kept in memory only.
+        Nothing is logged: not the value, not op's stderr.
+        """
+        if nas_cfg.get("password"):
+            return nas_cfg["password"]
+        ref = nas_cfg.get("password_ref")
+        if not ref or not str(ref).startswith("op://"):
+            raise Exception(f"NAS '{label}': no password and no op:// password_ref configured")
+        cache = self.__dict__.setdefault("_op_password_cache", {})
+        if ref in cache:
+            return cache[ref]
+        op_bin = shutil.which("op") or next(
+            (p for p in ("/opt/homebrew/bin/op", "/usr/local/bin/op") if shutil.which(p)), None
+        )
+        if not op_bin:
+            raise Exception(
+                f"NAS '{label}': password_ref set but the 1Password CLI (op) was not found"
+            )
+        try:
+            proc = subprocess.run(
+                [op_bin, "read", "--no-newline", ref],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            raise Exception(f"NAS '{label}': 1Password lookup timed out (is op signed in?)")
+        if proc.returncode != 0 or not proc.stdout:
+            raise Exception(f"NAS '{label}': 1Password lookup failed (is op signed in?)")
+        cache[ref] = proc.stdout
+        return proc.stdout
+
     def _login_nas(self, nas_name: Optional[str]) -> str:
         """Log in to a configured NAS and return its base_url.
 
         Single login path shared by startup auto-login and the on-demand login
         in _get_base_url, so the two cannot drift apart. Raises with the DSM
         error code on failure; callers decide whether that is fatal.
+
+        A NAS may list several `endpoints` (LAN IP, public IP, hostname, ...).
+        They are tried in order; the first that answers wins and becomes the
+        NAS's base_url for this process. An endpoint that answers but rejects
+        the login stops the search: the same credentials will fail on every
+        other address, and retrying risks an account lockout.
         """
         nas_cfg = config.get_synology_config(nas_name)
-        base_url = nas_cfg["base_url"].rstrip("/")
         label = nas_name or "default"
+        endpoints = nas_cfg.get("endpoints") or [{"label": "default", "url": nas_cfg["base_url"]}]
+        password = self._resolve_password(nas_cfg, label)
 
-        if base_url not in self.auth_instances:
-            self.auth_instances[base_url] = SynologyAuth(
-                base_url, verify_ssl=config.verify_ssl_for(base_url)
+        result = None
+        base_url = ""
+        unreachable = []
+        for ep in endpoints:
+            candidate = ep["url"].rstrip("/")
+            if len(endpoints) > 1 and not self._endpoint_reachable(candidate):
+                logger.info(f"{label}: endpoint {ep['label']} unreachable, trying next")
+                unreachable.append(ep["label"])
+                continue
+            if candidate not in self.auth_instances:
+                self.auth_instances[candidate] = SynologyAuth(
+                    candidate, verify_ssl=config.verify_ssl_for(candidate)
+                )
+            auth = self.auth_instances[candidate]
+            auth.on_relogin = self._resync_session_after_relogin
+            # Optional 2FA material from settings.json (or legacy .env for
+            # otp_code). device_id wins over otp_code; both None means the DSM
+            # account has 2FA off.
+            result = auth.login(
+                nas_cfg["username"],
+                password,
+                otp_code=nas_cfg.get("otp_code"),
+                device_id=nas_cfg.get("device_id"),
             )
+            base_url = candidate
+            if len(endpoints) > 1:
+                logger.info(f"{label}: logged in via endpoint {ep['label']}")
+            break
 
-        auth = self.auth_instances[base_url]
-        auth.on_relogin = self._resync_session_after_relogin
-        # Optional 2FA material from settings.json (or legacy .env for
-        # otp_code). device_id wins over otp_code; both None means the DSM
-        # account has 2FA off.
-        result = auth.login(
-            nas_cfg["username"],
-            nas_cfg["password"],
-            otp_code=nas_cfg.get("otp_code"),
-            device_id=nas_cfg.get("device_id"),
-        )
+        if result is None:
+            raise Exception(
+                f"NAS '{label}': no endpoint reachable (tried: {', '.join(unreachable)})"
+            )
 
         if not result.get("success"):
             raise Exception(
