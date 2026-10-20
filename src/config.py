@@ -446,6 +446,11 @@ class SynologyConfig:
                     port = nas_info.get("port", 5000)
                     username = nas_info.get("username", "")
                     password = nas_info.get("password", "")
+                    # `password_ref`: a 1Password secret reference (op://...).
+                    # Resolved at login time by the server, so no password has
+                    # to sit in this file.
+                    password_ref = nas_info.get("password_ref") or None
+                    endpoints = self._parse_endpoints(nas_name, nas_info.get("endpoints"))
 
                     # Optional 2FA/OTP support (DSM Login Web API Guide):
                     #   - `otp_code`: one-shot code from authenticator. Needed
@@ -459,7 +464,7 @@ class SynologyConfig:
                     otp_code = nas_info.get("otp_code") or None
                     device_id = nas_info.get("device_id") or None
 
-                    if not host and not explicit_url:
+                    if not host and not explicit_url and not endpoints:
                         logger.warning(
                             f"Missing 'host' (or 'url') for NAS '{nas_name}' in {SETTINGS_FILE}"
                         )
@@ -469,13 +474,19 @@ class SynologyConfig:
                             f"Missing 'username' for NAS '{nas_name}' in {SETTINGS_FILE}"
                         )
                         continue
-                    if not password:
+                    if not password and not password_ref:
                         logger.warning(
-                            f"Missing 'password' for NAS '{nas_name}' in {SETTINGS_FILE}"
+                            f"Missing 'password' (or 'password_ref') for NAS "
+                            f"'{nas_name}' in {SETTINGS_FILE}"
                         )
                         continue
 
-                    if explicit_url:
+                    if endpoints:
+                        # Ordered fallback list; the first entry is the
+                        # preferred address and doubles as the NAS identity
+                        # until a login picks a winner.
+                        base_url = endpoints[0]["url"]
+                    elif explicit_url:
                         base_url = explicit_url
                     else:
                         scheme = "https" if port == 5001 else "http"
@@ -497,8 +508,10 @@ class SynologyConfig:
 
                     self.nas_configs[nas_name] = {
                         "base_url": base_url,
+                        "endpoints": endpoints or [{"label": "default", "url": base_url}],
                         "username": username,
                         "password": password,
+                        "password_ref": password_ref,
 
                         "verify_ssl": nas_verify_ssl,
                         "note": nas_info.get("note", ""),
@@ -543,10 +556,55 @@ class SynologyConfig:
         """
         target = self._normalize_base_url(base_url)
         for cfg in self.nas_configs.values():
-            configured = cfg.get("base_url")
-            if configured and self._normalize_base_url(configured) == target:
-                return cfg.get("verify_ssl", self.verify_ssl)
+            candidates = [cfg.get("base_url")]
+            candidates += [ep["url"] for ep in cfg.get("endpoints", [])]
+            for configured in candidates:
+                if configured and self._normalize_base_url(configured) == target:
+                    return cfg.get("verify_ssl", self.verify_ssl)
         return self.verify_ssl
+
+    #: Ports DSM serves over TLS by default (443 proxy, 5001 DSM, 5003 a
+    #: common custom HTTPS port). Anything else is assumed plain http unless
+    #: the endpoint says otherwise.
+    _TLS_PORTS = (443, 5001, 5003)
+
+    @classmethod
+    def _parse_endpoints(cls, nas_name: str, raw: Any) -> List[Dict[str, str]]:
+        """Turn a settings `endpoints` list into [{"label", "url"}, ...].
+
+        Each entry is a URL string, or an object with `url`, or with `host`
+        (+ optional `port`, `scheme`) and an optional `label`. Order is the
+        order tried: put the fastest address first (LAN IP), the always-works
+        one last (public hostname). Bad entries are skipped with a warning.
+        """
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            logger.warning(f"Invalid 'endpoints' for NAS '{nas_name}' - expected a list")
+            return []
+        out: List[Dict[str, str]] = []
+        for i, item in enumerate(raw):
+            label = f"endpoint{i + 1}"
+            url = ""
+            if isinstance(item, str):
+                url = item
+            elif isinstance(item, dict):
+                label = str(item.get("label") or label)
+                if item.get("url"):
+                    url = str(item["url"])
+                elif item.get("host"):
+                    port = item.get("port")
+                    scheme = item.get("scheme") or (
+                        "https" if (port is None or port in cls._TLS_PORTS) else "http"
+                    )
+                    netloc = f"{item['host']}:{port}" if port else str(item["host"])
+                    url = f"{scheme}://{netloc}"
+            url = url.strip().rstrip("/")
+            if not urlsplit(url).hostname:
+                logger.warning(f"Skipping unusable endpoint #{i + 1} for NAS '{nas_name}'")
+                continue
+            out.append({"label": label, "url": url})
+        return out
 
     @staticmethod
     def _normalize_base_url(url: str) -> str:
@@ -617,6 +675,8 @@ class SynologyConfig:
             "username": self.synology_username,
             "password": self.synology_password,
 
+            "endpoints": [{"label": "default", "url": self.synology_url}],
+            "password_ref": None,
             "verify_ssl": self.verify_ssl,
             "otp_code": self.synology_otp_code,
             "device_id": None,

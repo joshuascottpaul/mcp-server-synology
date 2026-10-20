@@ -678,13 +678,28 @@ The docker-compose.yml automatically mounts your `~/.config/synology-mcp` direct
 | `host` | Yes* | NAS hostname or IP address |
 | `port` | No | API port (default: 5000 for HTTP, 5001 for HTTPS) |
 | `url` | Yes* | Full base URL (e.g., `https://nas.example.com`); wins over `host`/`port` — use for a NAS behind a reverse proxy |
+| `endpoints` | No | Ordered list of addresses for one NAS (LAN IP, public IP, hostname, alternate hostnames). Each item is a URL string, `{"url": ...}`, or `{"host", "port", "scheme", "label"}`. Tried in order with a 3 s reachability probe; the first that answers wins. Replaces `host`/`port`/`url` |
 | `username` | Yes | NAS username |
-| `password` | Yes | NAS password |
+| `password` | Yes* | NAS password |
+| `password_ref` | Yes* | 1Password reference (`op://vault/item/field`), read with `op read` at login and kept in memory only. Use instead of `password` |
 | `otp_code` | No | One-shot 6-digit 2FA code (first login only, then remove) |
 | `device_id` | No | Long-lived trusted-device token from DSM (`did`); skip OTP on all future logins |
 | `note` | No | Optional description for your reference |
 
-*Either `host` or `url` is required per NAS entry.
+*Either `host`, `url` or `endpoints` is required per NAS entry, and either `password` or `password_ref`.
+
+**Several addresses for one NAS:**
+```json
+"home-nas": {
+  "username": "svc",
+  "password_ref": "op://Private/home-nas svc/password",
+  "endpoints": [
+    {"label": "lan", "host": "192.168.1.90", "port": 5001},
+    {"label": "public", "url": "https://home-nas.example.com:5001"}
+  ]
+}
+```
+A reachable endpoint that rejects the login stops the search. The same credentials would fail everywhere, and retrying risks an account lockout.
 
 **Notes:**
 - The server will use port 5001 (HTTPS) if port is 5001, otherwise defaults to HTTP (5000)
